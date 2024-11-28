@@ -822,7 +822,47 @@ class ConnectionTest extends TestCase
         $connection->publish('body', [], 5000);
     }
 
-    public function testItWillRetryMaxThreeTimesWhenAMQPConnectionExceptionIsThrown()
+    public function recoverableExceptionsDataProvider(): iterable
+    {
+        yield [
+            'connectionMethod' => 'publish',
+            'connectionArgs' => ['body'],
+            'amqpClass' => 'amqpExchange',
+            'amqpMethod' => 'publish',
+            'amqpException' => new \AMQPConnectionException('a socket error occurred')
+        ];
+
+        yield [
+            'connectionMethod' => 'setup',
+            'connectionArgs' => [],
+            'amqpClass' => 'amqpExchange',
+            'amqpMethod' => 'declareExchange',
+            'amqpException' => new \AMQPException('Invalid frame type 65')
+        ];
+
+        $envelope = $this->createMock(\AMQPEnvelope::class);
+        $envelope->method('getDeliveryTag')->willReturn(1);
+        yield [
+            'connectionMethod' => 'ack',
+            'connectionArgs' => [$envelope, 'testQueueName'],
+            'amqpClass' => 'amqpQueue',
+            'amqpMethod' => 'ack',
+            'amqpException' => new \AMQPException('PRECONDITION_FAILED - unknown delivery tag 5')
+        ];
+
+        yield [
+            'connectionMethod' => 'get',
+            'connectionArgs' => ['testQueueName'],
+            'amqpClass' => 'amqpQueue',
+            'amqpMethod' => 'get',
+            'amqpException' => new \AMQPException('Library error: a SSL error occurred')
+        ];
+    }
+
+    /**
+     * @dataProvider recoverableExceptionsDataProvider
+     */
+    public function testItWillRetryMaxThreeTimesWhenRecoverableAMQPExceptionIsThrown(string $connectionMethod, array $connectionArgs, string $amqpClass, string $amqpMethod, \AMQPException $amqpException)
     {
         $factory = new TestAmqpFactory(
             $amqpConnection = $this->createMock(\AMQPConnection::class),
@@ -831,22 +871,20 @@ class ConnectionTest extends TestCase
             $amqpExchange = $this->createMock(\AMQPExchange::class)
         );
 
-        $exception = new \AMQPConnectionException('a socket error occurred');
-
-        $amqpExchange->expects($this->exactly(4))
-            ->method('publish')
+        $$amqpClass->expects($this->exactly(4))
+            ->method($amqpMethod)
             ->willReturnOnConsecutiveCalls(
-                $this->throwException($exception),
-                $this->throwException($exception),
-                $this->throwException($exception),
-                $this->throwException($exception),
+                $this->throwException($amqpException),
+                $this->throwException($amqpException),
+                $this->throwException($amqpException),
+                $this->throwException($amqpException),
             );
 
-        self::expectException($exception::class);
-        self::expectExceptionMessage($exception->getMessage());
+        self::expectException($amqpException::class);
+        self::expectExceptionMessage($amqpException->getMessage());
 
         $connection = Connection::fromDsn('amqp://localhost', [], $factory);
-        $connection->publish('body');
+        $connection->{$connectionMethod}(...$connectionArgs);
     }
 
     private function createDelayOrRetryConnection(\AMQPExchange $delayExchange, string $deadLetterExchangeName, string $delayQueueName): Connection

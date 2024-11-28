@@ -309,7 +309,14 @@ class Connection
      */
     public function countMessagesInQueues(): int
     {
-        return array_sum(array_map(fn ($queueName) => $this->queue($queueName)->declareQueue(), $this->getQueueNames()));
+        return array_sum(
+            array_map(
+                function (string $queueName): int {
+                    return $this->withConnectionExceptionRetry(fn() => $this->queue($queueName)->declareQueue());
+                },
+                $this->getQueueNames()
+            )
+        );
     }
 
     /**
@@ -429,21 +436,27 @@ class Connection
             $this->setupExchangeAndQueues();
         }
 
-        if (false !== $message = $this->queue($queueName)->get()) {
-            return $message;
-        }
+        return $this->withConnectionExceptionRetry(function () use ($queueName) {
+            if (false !== $message = $this->queue($queueName)->get()) {
+                return $message;
+            }
 
-        return null;
+            return null;
+        });
     }
 
     public function ack(\AMQPEnvelope $message, string $queueName): bool
     {
-        return $this->queue($queueName)->ack($message->getDeliveryTag()) ?? true;
+        return $this->withConnectionExceptionRetry(
+            fn () => $this->queue($queueName)->ack($message->getDeliveryTag()) ?? true
+        );
     }
 
     public function nack(\AMQPEnvelope $message, string $queueName, int $flags = \AMQP_NOPARAM): bool
     {
-        return $this->queue($queueName)->nack($message->getDeliveryTag(), $flags) ?? true;
+        return $this->withConnectionExceptionRetry(
+            fn () => $this->queue($queueName)->nack($message->getDeliveryTag(), $flags) ?? true
+        );
     }
 
     public function setup(): void
@@ -454,14 +467,16 @@ class Connection
 
     private function setupExchangeAndQueues(): void
     {
-        $this->exchange()->declareExchange();
+        $this->withConnectionExceptionRetry(function (): void {
+            $this->exchange()->declareExchange();
 
-        foreach ($this->queuesOptions as $queueName => $queueConfig) {
-            $this->queue($queueName)->declareQueue();
-            foreach ($queueConfig['binding_keys'] ?? [null] as $bindingKey) {
-                $this->queue($queueName)->bind($this->exchangeOptions['name'], $bindingKey, $queueConfig['binding_arguments'] ?? []);
+            foreach ($this->queuesOptions as $queueName => $queueConfig) {
+                $this->queue($queueName)->declareQueue();
+                foreach ($queueConfig['binding_keys'] ?? [null] as $bindingKey) {
+                    $this->queue($queueName)->bind($this->exchangeOptions['name'], $bindingKey, $queueConfig['binding_arguments'] ?? []);
+                }
             }
-        }
+        });
         $this->autoSetupExchange = false;
     }
 
@@ -564,9 +579,11 @@ class Connection
 
     public function purgeQueues(): void
     {
-        foreach ($this->getQueueNames() as $queueName) {
-            $this->queue($queueName)->purge();
-        }
+        $this->withConnectionExceptionRetry(function (): void {
+            foreach ($this->getQueueNames() as $queueName) {
+                $this->queue($queueName)->purge();
+            }
+        });
     }
 
     private function getRoutingKeyForMessage(?AmqpStamp $amqpStamp): ?string
@@ -574,22 +591,55 @@ class Connection
         return $amqpStamp?->getRoutingKey() ?? $this->getDefaultPublishRoutingKey();
     }
 
-    private function withConnectionExceptionRetry(callable $callable): void
+    private function withConnectionExceptionRetry(callable $callable): mixed
     {
+        $isRecoverable = function (\AMQPException $e): bool {
+            if ($e instanceof \AMQPConnectionException) {
+                return true;
+            }
+
+            $recoverableExceptionMessages = [
+                'PRECONDITION_FAILED - unknown delivery tag', // when trying to ack/nack previously fetched message using the new connection
+                'Library error: a SSL error occurred', // when the connection timeouts with SSL
+                'Library error: a socket error occurred', // when the connection timeouts without SSL
+                'Broken pipe or closed connection', // when the connection is closed
+                'Library error: connection closed unexpectedly', // also when the connection is closed
+                'Invalid frame type 65', // 65 is ASCII for A, which is the first letter of 'AMQP' header
+            ];
+
+            foreach ($recoverableExceptionMessages as $recoverableExceptionMessage) {
+                if (str_contains($e->getMessage(), $recoverableExceptionMessage)) {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
         $maxRetries = 3;
         $retries = 0;
 
         retry:
         try {
-            $callable();
-        } catch (\AMQPConnectionException $e) {
-            if (++$retries <= $maxRetries) {
-                $this->clear();
+            return $callable();
+        } catch (\AMQPException $e) {
+            if ($isRecoverable($e) && ++$retries <= $maxRetries) {
+                $this->tryToReconnect();
 
                 goto retry;
             }
 
             throw $e;
+        }
+    }
+
+    private function tryToReconnect(): void
+    {
+        try {
+            $amqpConnection = $this->channel()->getConnection();
+            $amqpConnection->isPersistent() ? $amqpConnection->preconnect() : $amqpConnection->reconnect();
+        } catch (\AMQPException) {
+            $this->clear();
         }
     }
 }
